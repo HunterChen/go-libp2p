@@ -16,6 +16,7 @@ import (
 	pstore "github.com/libp2p/go-libp2p-peerstore"
 	protocol "github.com/libp2p/go-libp2p-protocol"
 	ma "github.com/multiformats/go-multiaddr"
+	madns "github.com/multiformats/go-multiaddr-dns"
 	msmux "github.com/multiformats/go-multistream"
 )
 
@@ -53,11 +54,12 @@ const NATPortMap Option = iota
 //  * uses an identity service to send + receive node information
 //  * uses a nat service to establish NAT port mappings
 type BasicHost struct {
-	network inet.Network
-	mux     *msmux.MultistreamMuxer
-	ids     *identify.IDService
-	natmgr  *natManager
-	addrs   AddrsFactory
+	network    inet.Network
+	mux        *msmux.MultistreamMuxer
+	ids        *identify.IDService
+	natmgr     *natManager
+	addrs      AddrsFactory
+	maResolver *madns.Resolver
 
 	negtimeout time.Duration
 
@@ -86,6 +88,8 @@ type HostOpts struct {
 	// If omitted, there's no override or filtering, and the results of Addrs and AllAddrs are the same.
 	AddrsFactory AddrsFactory
 
+	MultiaddrResolver *madns.Resolver
+
 	// NATManager takes care of setting NAT port mappings, and discovering external addresses.
 	// If omitted, this will simply be disabled.
 	//
@@ -105,6 +109,7 @@ func NewHost(net inet.Network, opts *HostOpts) *BasicHost {
 		mux:        msmux.NewMultistreamMuxer(),
 		negtimeout: DefaultNegotiationTimeout,
 		addrs:      DefaultAddrsFactory,
+		maResolver: madns.DefaultResolver,
 	}
 
 	if opts.MultistreamMuxer != nil {
@@ -128,6 +133,10 @@ func NewHost(net inet.Network, opts *HostOpts) *BasicHost {
 
 	if opts.NATManager != nil {
 		h.natmgr = opts.NATManager
+	}
+
+	if opts.MultiaddrResolver != nil {
+		h.maResolver = opts.MultiaddrResolver
 	}
 
 	if opts.BandwidthReporter != nil {
@@ -165,6 +174,8 @@ func New(net inet.Network, opts ...interface{}) *BasicHost {
 			hostopts.BandwidthReporter = o
 		case AddrsFactory:
 			hostopts.AddrsFactory = AddrsFactory(o)
+		case *madns.Resolver:
+			hostopts.MultiaddrResolver = o
 		}
 	}
 
@@ -367,14 +378,31 @@ func (h *BasicHost) newStream(ctx context.Context, p peer.ID, pid protocol.ID) (
 }
 
 // Connect ensures there is a connection between this host and the peer with
-// given peer.ID. Connect will absorb the addresses in pi into its internal
-// peerstore. If there is not an active connection, Connect will issue a
-// h.Network.Dial, and block until a connection is open, or an error is
-// returned.
+// given peer.ID. If there is not an active connection, Connect will issue a
+// h.Network.Dial, and block until a connection is open, or an error is returned.
+// Connect will absorb the addresses in pi into its internal peerstore.
+// It will also resolve any /dns4, /dns6, and /dnsaddr addresses.
 func (h *BasicHost) Connect(ctx context.Context, pi pstore.PeerInfo) error {
+	addrs := []ma.Multiaddr{}
+	for _, addr := range pi.Addrs {
+		addrs = append(addrs, addr)
+		p2paddr := ma.Join(addr, ma.StringCast("/ipfs/"+pi.ID.Pretty()))
+
+		resaddrs, err := h.maResolver.Resolve(ctx, p2paddr)
+		if err != nil {
+			log.Infof("error resolving %s: %s", p2paddr, err)
+		}
+		for _, res := range resaddrs {
+			pi, err := pstore.InfoFromP2pAddr(res)
+			if err != nil {
+				log.Infof("error parsing %s: %s", res, err)
+			}
+			addrs = append(addrs, pi.Addrs...)
+		}
+	}
 
 	// absorb addresses into peerstore
-	h.Peerstore().AddAddrs(pi.ID, pi.Addrs, pstore.TempAddrTTL)
+	h.Peerstore().AddAddrs(pi.ID, addrs, pstore.TempAddrTTL)
 
 	cs := h.Network().ConnsToPeer(pi.ID)
 	if len(cs) > 0 {
